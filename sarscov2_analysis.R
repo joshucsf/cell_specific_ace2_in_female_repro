@@ -32,6 +32,43 @@ if (SPECIES == "HUMAN") {
 
 ############### Functions #####################
 
+pp <- function(seurat_object, HEMOGENES=NULL, subset=TRUE, SCT = FALSE, VAR.FEATURES=3000, MAX_FEATURES_PER_CELL=2500, MIN_FEATURES_PER_CELL=100, MAX_PERCENT_MT=5, DIMS=40) {
+  genes <- rownames(seurat_object@assays$RNA@counts)
+  genes.mt <- genes[grep("^M[Tt]-", genes)]
+  print(paste0("found ", length(genes.mt), " genes: ", paste(genes.mt, collapse = " ")))
+  seurat_object[["percent.mt"]] <- PercentageFeatureSet(object = seurat_object, pattern = "^M[Tt]-")
+  
+  genes.ribo <- genes[grep("^R[Pp][Ss]|R[Pp][Ll]", genes)]
+  print(paste0("found ", length(genes.ribo), " genes: ", paste(genes.ribo, collapse = " ")))
+  seurat_object[["percent.ribo"]] <- PercentageFeatureSet(object = seurat_object, pattern = "^R[Pp][Ss]|R[Pp][Ll]")
+  
+  if (is.null(HEMOGENES)) {
+    genes.hemo <- genes[grep("^H[Bb][Bb]|^H[Bb][Aa][12]", genes)]
+  } else genes.hemo <- HEMOGENES
+  print(paste0("found ", length(genes.hemo), " genes: ", paste(genes.hemo, collapse = " ")))
+  seurat_object[["percent.hbb"]] <- PercentageFeatureSet(object = seurat_object, features = genes.hemo)
+  featureinfo <- seurat_object@meta.data[,c("nCount_RNA", "nFeature_RNA", "orig.ident", "percent.mt", "percent.ribo", "percent.hbb")]
+  #subset on filtered cells and continue
+  if (subset) {
+    seurat_object <- subset(x = seurat_object, subset = nFeature_RNA > MIN_FEATURES_PER_CELL & nFeature_RNA < MAX_FEATURES_PER_CELL & percent.mt < 5)
+  }
+  if (SCT) {
+    seurat_object <- SCTransform(seurat_object, vars.to.regress = "percent.mt") #use this to replace scaledata if it's not good enough
+  } else {
+    seurat_object <- NormalizeData(seurat_object, normalization.method = "LogNormalize", scale.factor = 1e4)
+    seurat_object <- FindVariableFeatures(object = seurat_object, selection.method = 'vst', nfeatures = VAR.FEATURES)
+    seurat_object <- ScaleData(object = seurat_object, vars.to.regress = c('percent.mt') )
+  }
+  seurat_object <- RunPCA(object = seurat_object, features = VariableFeatures(object = seurat_object))
+  seurat_object <- RunUMAP(object = seurat_object, dims=1:DIMS) #VariableFeatures(seurat_object) makes it error -> need dims for some reason 
+  seurat_object <- FindNeighbors(object = seurat_object, dims=1:DIMS)
+  seurat_object <- FindClusters(object = seurat_object, dims=1:DIMS, resolution = 0.4)
+  message("saving...")
+  saveRDS(seurat_object, paste0(seurat_object@project.name, "_pp.rds"))
+  return(seurat_object)
+}
+
+
 allUMAPs <- function(seurat_object) {
   UMAPPlot(seurat_object, group.by="seurat_clusters", label=TRUE)
   ggsave("umap_byCluster.png", device = "png", units = "in", width = 7, height = 6)
@@ -55,6 +92,11 @@ clusterDE <- function(seurat_object, name, cluster_col=NULL, assay="RNA") {
   height80dpi <- (length(as.vector(top10$gene))*12)*(1/80)+1
   ggsave(paste0("heatmap_", name, ".png"), height= height80dpi, width = 8)
 }
+
+PercentAbove <- function(x, threshold=1){
+  return(length(x = x[x > threshold]) / length(x = x))
+}
+
 getDotplotData <- function(seurat_object, features) {
   data.features <- FetchData(object = seurat_object, vars = features)
   data.features$id <- Idents(seurat_object)
@@ -69,6 +111,7 @@ getDotplotData <- function(seurat_object, features) {
           return(mean(x = expm1(x = x)))
         }
       )
+      print(data.use)
       pct.exp <- apply(X = data.use, MARGIN = 2, FUN = PercentAbove)
       return(list(avg.exp = avg.exp, pct.exp = pct.exp))
     }
@@ -963,18 +1006,62 @@ for (i in 1:length(oblist)) {
 }
 
 
+# human data from https://doi.org/10.1016/j.cell.2020.04.035 ----
+# download is here: https://drive.google.com/drive/folders/1bxCIqNeZ7wLuVOT16gphwj98_cc9KhrV
+setwd("")
+homedir <- getwd()
+raw <- read.table("Human_lung_epithelial_cell_raw_counts.txt", header=T, row.names = 1, sep = "\t")
+meta <- read.csv("Human_lung_epithelial_metadata.csv", header=T, row.names = 1)
+lung <- CreateSeuratObject(as.matrix(raw))
+length(intersect(rownames(meta), colnames(lung@assays$RNA@counts)))
+meta <- meta[rownames(lung@meta.data),]
+lung@meta.data <- merge(lung@meta.data, meta, by="row.names")
+rownames(lung@meta.data) <- lung@meta.data[,1]
+HEMOGENES=HEMOGENES.HSA
+lung <- pp(lung, 
+           HEMOGENES=HEMOGENES.HSA, 
+           subset=TRUE, 
+           SCT = FALSE, 
+           VAR.FEATURES=2000, 
+           MAX_FEATURES_PER_CELL=2500, 
+           MIN_FEATURES_PER_CELL=200)
 
+#umap
+x <- UMAPPlot(lung, pt.size = 1, group.by="seurat_clusters", label=TRUE) +
+  theme(panel.grid = element_blank(), 
+        plot.background = element_rect(fill="white"), 
+        legend.text = element_text(face="bold",size=18)) +
+  guides(color=guide_legend(ncol=1, override.aes = list(size=10)))
+y <- ggplot_build(x)
+y$data[[2]]$fontface <- 2
+y$data[[2]]$size <- 4
+z <- ggplot_gtable(y)
+pdf(paste0(homedir, "/betterumap.pdf"))
+plot(z)
+dev.off()
 
+DefaultAssay(lung) #RNA
 
+#coexpression dotplot
+sarsCov2Coexpression(lung, paste0(homedir, "/"))
 
+#features to show why ace2 + tmprss2 aren't in the same cells (it's because there aren't many cells)
+FeaturePlot(lung, features=c("ACE2", "TMPRSS2"), blend=T)
+ggsave("lung_ace2_tmprss2_blend.pdf", width=16,height=4)
+FeaturePlot(lung, features = sarsCov2.features.gene,cols = c(LIGHTGRAY, DARKBLUE))
+ggsave(paste0(homedir, "/sars_featureplot.pdf"), height=10,width=10)
 
+#cluster DE
+lung.markers <- FindAllMarkers(lung, only.pos = T)
+write.table(lung.markers, "lung_cluster_markers.txt", sep = "\t", quote = F, col.names = NA)
 
-
-
-
-
-
-
+#heatmap
+lung.markers$rank <- (lung.markers$pct.1 * lung.markers$avg_logFC) / lung.markers$pct.2
+top5 <- lung.markers %>% group_by(cluster) %>% top_n(5, rank)
+height80dpi <- (length(as.vector(top5$gene))*12)*(1/80)+1
+pdf("heatmap.pdf", width=5.5,height=height80dpi)
+print(DoHeatmap(lung, features = as.vector(top5$gene)))
+dev.off()
 
 
 
